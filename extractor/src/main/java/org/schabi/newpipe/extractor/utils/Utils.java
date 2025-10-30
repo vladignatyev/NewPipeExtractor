@@ -2,6 +2,7 @@ package org.schabi.newpipe.extractor.utils;
 
 import org.schabi.newpipe.extractor.exceptions.ParsingException;
 
+import java.io.UnsupportedEncodingException;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLDecoder;
@@ -34,16 +35,25 @@ public final class Utils {
      * @return The encoded URL.
      */
     public static String encodeUrlUtf8(final String string) {
-        return URLEncoder.encode(string, StandardCharsets.UTF_8);
+        try {
+            return URLEncoder.encode(string, "UTF-8");
+        } catch (UnsupportedEncodingException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     /**
      * Decodes a URL using the UTF-8 character set.
+     *
      * @param url The URL to be decoded.
      * @return The decoded URL.
      */
     public static String decodeUrlUtf8(final String url) {
-        return URLDecoder.decode(url, StandardCharsets.UTF_8);
+        try {
+            return URLDecoder.decode(url, "UTF-8");
+        } catch (UnsupportedEncodingException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     /**
@@ -355,7 +365,7 @@ public final class Utils {
      * @param group   the group to match
      * @return the result
      * @throws Parser.RegexException if none of the patterns match the input, or at least in the
-     * specified group
+     *                               specified group
      */
     @Nonnull
     public static String getStringResultFromRegexArray(@Nonnull final String input,
@@ -379,7 +389,7 @@ public final class Utils {
      * @param group   the group to match
      * @return the result
      * @throws Parser.RegexException if none of the patterns match the input, or at least in the
-     * specified group
+     *                               specified group
      */
     @Nonnull
     public static String getStringResultFromRegexArray(@Nonnull final String input,
