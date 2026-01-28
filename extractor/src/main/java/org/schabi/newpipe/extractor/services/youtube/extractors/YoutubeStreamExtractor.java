@@ -53,6 +53,7 @@ import org.schabi.newpipe.extractor.exceptions.PaidContentException;
 import org.schabi.newpipe.extractor.exceptions.ParsingException;
 import org.schabi.newpipe.extractor.exceptions.PrivateContentException;
 import org.schabi.newpipe.extractor.exceptions.YoutubeMusicPremiumContentException;
+import org.schabi.newpipe.extractor.exceptions.SignInConfirmNotBotException;
 import org.schabi.newpipe.extractor.linkhandler.LinkHandler;
 import org.schabi.newpipe.extractor.localization.ContentCountry;
 import org.schabi.newpipe.extractor.localization.DateWrapper;
@@ -86,20 +87,38 @@ import org.schabi.newpipe.extractor.utils.Utils;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
-import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 public class YoutubeStreamExtractor extends StreamExtractor {
+
+    private static final String PREMIERED = "Premiered ";
+    private static final String PREMIERED_ON = "Premiered on ";
+    private static final String FORMATS = "formats";
+    private static final String ADAPTIVE_FORMATS = "adaptiveFormats";
+    private static final String STREAMING_DATA = "streamingData";
+    private static final String NEXT = "next";
+    private static final String SIGNATURE_CIPHER = "signatureCipher";
+    private static final String CIPHER = "cipher";
+    private static final String PLAYER_CAPTIONS_TRACKLIST_RENDERER
+            = "playerCaptionsTracklistRenderer";
+    private static final String CAPTIONS = "captions";
+    private static final String PLAYABILITY_STATUS = "playabilityStatus";
+    private static final String THUMBNAIL = "thumbnail";
+    private static final String THUMBNAILS = "thumbnails";
+    private static final String VIDEO_DETAILS = "videoDetails";
+    private static final String TITLE = "title";
 
     @Nullable
     private static PoTokenProvider poTokenProvider;
@@ -112,13 +131,12 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     private JsonObject iosStreamingData;
     @Nullable
     private JsonObject androidStreamingData;
-    @Nullable
-    private JsonObject html5StreamingData;
 
     private JsonObject videoPrimaryInfoRenderer;
     private JsonObject videoSecondaryInfoRenderer;
     private JsonObject playerMicroFormatRenderer;
     private JsonObject playerCaptionsTracklistRenderer;
+    private JsonArray thumbnailsArray;
     private int ageLimit = -1;
     private StreamType streamType;
 
@@ -128,10 +146,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     // three different strings are used.
     private String iosCpn;
     private String androidCpn;
-    private String html5Cpn;
 
-    @Nullable
-    private String html5StreamingUrlsPoToken;
     @Nullable
     private String androidStreamingUrlsPoToken;
     @Nullable
@@ -152,10 +167,11 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         String title;
 
         // Try to get the video's original title, which is untranslated
-        title = playerResponse.getObject("videoDetails").getString("title");
+        title = playerResponse.getObject(VIDEO_DETAILS)
+                .getString(TITLE);
 
         if (isNullOrEmpty(title)) {
-            title = getTextFromObject(getVideoPrimaryInfoRenderer().getObject("title"));
+            title = getTextFromObject(getVideoPrimaryInfoRenderer().getObject(TITLE));
 
             if (isNullOrEmpty(title)) {
                 throw new ParsingException("Could not get name");
@@ -167,79 +183,74 @@ public class YoutubeStreamExtractor extends StreamExtractor {
 
     @Nullable
     @Override
-    public String getTextualUploadDate() throws ParsingException {
-        if (!playerMicroFormatRenderer.getString("uploadDate", "").isEmpty()) {
-            return playerMicroFormatRenderer.getString("uploadDate");
-        } else if (!playerMicroFormatRenderer.getString("publishDate", "").isEmpty()) {
-            return playerMicroFormatRenderer.getString("publishDate");
+    public String getTextualUploadDate() {
+        String timestamp = playerMicroFormatRenderer.getString("uploadDate", "");
+        if (timestamp.isEmpty()) {
+            timestamp = playerMicroFormatRenderer.getString("publishDate", "");
+        }
+        if (!timestamp.isEmpty()) {
+            return timestamp;
         }
 
-        final JsonObject liveDetails = playerMicroFormatRenderer.getObject(
-                "liveBroadcastDetails");
-        if (!liveDetails.getString("endTimestamp", "").isEmpty()) {
-            // an ended live stream
-            return liveDetails.getString("endTimestamp");
-        } else if (!liveDetails.getString("startTimestamp", "").isEmpty()) {
+        final var liveDetails = playerMicroFormatRenderer.getObject("liveBroadcastDetails");
+        timestamp = liveDetails.getString("endTimestamp", ""); // an ended live stream
+        if (timestamp.isEmpty()) {
             // a running live stream
-            return liveDetails.getString("startTimestamp");
+            timestamp = liveDetails.getString("startTimestamp", "");
+        }
+        if (!timestamp.isEmpty()) {
+            return timestamp;
         } else if (getStreamType() == StreamType.LIVE_STREAM) {
             // this should never be reached, but a live stream without upload date is valid
             return null;
         }
 
-        final String videoPrimaryInfoRendererDateText =
-                getTextFromObject(getVideoPrimaryInfoRenderer().getObject("dateText"));
-
-        if (videoPrimaryInfoRendererDateText != null) {
-            if (videoPrimaryInfoRendererDateText.startsWith("Premiered")) {
-                final String time = videoPrimaryInfoRendererDateText.substring(13);
-
-                try { // Premiered 20 hours ago
-                    final TimeAgoParser timeAgoParser = TimeAgoPatternsManager.getTimeAgoParserFor(
-                            new Localization("en"));
-                    final OffsetDateTime parsedTime = timeAgoParser.parse(time).offsetDateTime();
-                    return DateTimeFormatter.ISO_LOCAL_DATE.format(parsedTime);
-                } catch (final Exception ignored) {
-                }
-
-                try { // Premiered Feb 21, 2020
-                    final LocalDate localDate = LocalDate.parse(time,
-                            DateTimeFormatter.ofPattern("MMM dd, yyyy", Locale.ENGLISH));
-                    return DateTimeFormatter.ISO_LOCAL_DATE.format(localDate);
-                } catch (final Exception ignored) {
-                }
-
-                try { // Premiered on 21 Feb 2020
-                    final LocalDate localDate = LocalDate.parse(time,
-                            DateTimeFormatter.ofPattern("dd MMM yyyy", Locale.ENGLISH));
-                    return DateTimeFormatter.ISO_LOCAL_DATE.format(localDate);
-                } catch (final Exception ignored) {
-                }
-            }
-
-            try {
-                // TODO: this parses English formatted dates only, we need a better approach to
-                //  parse the textual date
-                final LocalDate localDate = LocalDate.parse(videoPrimaryInfoRendererDateText,
-                        DateTimeFormatter.ofPattern("dd MMM yyyy", Locale.ENGLISH));
-                return DateTimeFormatter.ISO_LOCAL_DATE.format(localDate);
-            } catch (final Exception e) {
-                throw new ParsingException("Could not get upload date", e);
-            }
+        final var textObject = getVideoPrimaryInfoRenderer().getObject("dateText");
+        final String rendererDateText = getTextFromObject(textObject);
+        if (rendererDateText == null) {
+            return null;
+        } else if (rendererDateText.startsWith(PREMIERED_ON)) { // Premiered on 21 Feb 2020
+            return rendererDateText.substring(PREMIERED_ON.length());
+        } else if (rendererDateText.startsWith(PREMIERED)) {
+            // Premiered 20 hours ago / Premiered Feb 21, 2020
+            return rendererDateText.substring(PREMIERED.length());
+        } else {
+            return rendererDateText;
         }
-
-        throw new ParsingException("Could not get upload date");
     }
 
     @Override
     public DateWrapper getUploadDate() throws ParsingException {
-        final String textualUploadDate = getTextualUploadDate();
-
-        if (isNullOrEmpty(textualUploadDate)) {
-            return null;
+        final String dateText = getTextualUploadDate();
+        try {
+            return DateWrapper.fromOffsetDateTime(dateText);
+        } catch (final ParsingException e) {
+            // Try other patterns first
         }
 
-        return new DateWrapper(YoutubeParsingHelper.parseDateFrom(textualUploadDate), true);
+        try { // Premiered 20 hours ago
+            final var localization = new Localization("en");
+            return TimeAgoPatternsManager.getTimeAgoParserFor(localization).parse(dateText);
+        } catch (final ParsingException e) {
+            // Try other patterns first
+        }
+
+        return parseOptionalDate(dateText, "MMM dd, yyyy")
+                .or(() -> parseOptionalDate(dateText, "dd MMM yyyy"))
+                .map(date -> new DateWrapper(date.atStartOfDay(), true))
+                .orElseThrow(() ->
+                    new ParsingException("Could not parse upload date \"" + dateText + "\""));
+    }
+
+    private Optional<LocalDate> parseOptionalDate(final String date, final String pattern) {
+        try {
+            // TODO: this parses English formatted dates only, we need a better approach to parse
+            // the textual date
+            final var formatter = DateTimeFormatter.ofPattern(pattern, Locale.ENGLISH);
+            return Optional.of(LocalDate.parse(date, formatter));
+        } catch (final DateTimeParseException e) {
+            return Optional.empty();
+        }
     }
 
     @Nonnull
@@ -247,9 +258,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     public List<Image> getThumbnails() throws ParsingException {
         assertPageFetched();
         try {
-            return getImagesFromThumbnailsArray(playerResponse.getObject("videoDetails")
-                    .getObject("thumbnail")
-                    .getArray("thumbnails"));
+            return getImagesFromThumbnailsArray(thumbnailsArray);
         } catch (final Exception e) {
             throw new ParsingException("Could not get thumbnails");
         }
@@ -273,7 +282,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             return new Description(attributedDescription, Description.HTML);
         }
 
-        String description = playerResponse.getObject("videoDetails")
+        String description = playerResponse.getObject(VIDEO_DETAILS)
                 .getString("shortDescription");
         if (description == null) {
             final JsonObject descriptionObject = playerMicroFormatRenderer.getObject("description");
@@ -323,13 +332,12 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         assertPageFetched();
 
         try {
-            final String duration = playerResponse
-                    .getObject("videoDetails")
+            final String duration = playerResponse.getObject(VIDEO_DETAILS)
                     .getString("lengthSeconds");
             return Long.parseLong(duration);
         } catch (final Exception e) {
             return getDurationFromFirstAdaptiveFormat(Arrays.asList(
-                    html5StreamingData, androidStreamingData, iosStreamingData));
+                    androidStreamingData, iosStreamingData));
         }
     }
 
@@ -375,7 +383,8 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                 .getObject("videoViewCountRenderer").getObject("viewCount"));
 
         if (isNullOrEmpty(views)) {
-            views = playerResponse.getObject("videoDetails").getString("viewCount");
+            views = playerResponse.getObject(VIDEO_DETAILS)
+                    .getString("viewCount");
 
             if (isNullOrEmpty(views)) {
                 throw new ParsingException("Could not get view count");
@@ -394,7 +403,8 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         assertPageFetched();
 
         // If ratings are not allowed, there is no like count available
-        if (!playerResponse.getObject("videoDetails").getBoolean("allowRatings")) {
+        if (!playerResponse.getObject(VIDEO_DETAILS)
+                .getBoolean("allowRatings")) {
             return -1L;
         }
 
@@ -516,7 +526,8 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         // Don't use the id in the videoSecondaryRenderer object to get real id of the uploader
         // The difference between the real id of the channel and the displayed id is especially
         // visible for music channels and autogenerated channels.
-        final String uploaderId = playerResponse.getObject("videoDetails").getString("channelId");
+        final String uploaderId = playerResponse.getObject(VIDEO_DETAILS)
+                .getString("channelId");
         if (!isNullOrEmpty(uploaderId)) {
             return YoutubeChannelLinkHandlerFactory.getInstance().getUrl("channel/" + uploaderId);
         }
@@ -532,7 +543,8 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         // Don't use the name in the videoSecondaryRenderer object to get real name of the uploader
         // The difference between the real name of the channel and the displayed name is especially
         // visible for music channels and autogenerated channels.
-        final String uploaderName = playerResponse.getObject("videoDetails").getString("author");
+        final String uploaderName = playerResponse.getObject(VIDEO_DETAILS)
+                .getString("author");
         if (isNullOrEmpty(uploaderName)) {
             throw new ParsingException("Could not get uploader name");
         }
@@ -542,23 +554,48 @@ public class YoutubeStreamExtractor extends StreamExtractor {
 
     @Override
     public boolean isUploaderVerified() throws ParsingException {
-        return YoutubeParsingHelper.isVerified(
-                getVideoSecondaryInfoRenderer()
+        final JsonObject videoOwnerRenderer = getVideoSecondaryInfoRenderer()
                         .getObject("owner")
-                        .getObject("videoOwnerRenderer")
-                        .getArray("badges"));
+                        .getObject("videoOwnerRenderer");
+
+        if (videoOwnerRenderer.has("badges")) {
+            return YoutubeParsingHelper.isVerified(videoOwnerRenderer
+                .getArray("badges"));
+        }
+
+
+        final JsonObject channel = YoutubeParsingHelper.getFirstCollaborator(
+            videoOwnerRenderer.getObject("navigationEndpoint"));
+        if (channel == null) {
+            return false;
+        }
+
+        return YoutubeParsingHelper.hasArtistOrVerifiedIconBadgeAttachment(
+            channel.getObject(TITLE)
+                    .getArray("attachmentRuns"));
     }
 
     @Nonnull
     @Override
     public List<Image> getUploaderAvatars() throws ParsingException {
         assertPageFetched();
+        final JsonObject owner = getVideoSecondaryInfoRenderer().getObject("owner")
+                        .getObject("videoOwnerRenderer");
 
-        final List<Image> imageList = getImagesFromThumbnailsArray(
-                getVideoSecondaryInfoRenderer().getObject("owner")
-                        .getObject("videoOwnerRenderer")
-                        .getObject("thumbnail")
-                        .getArray("thumbnails"));
+        final List<Image> imageList;
+        if (owner.has("avatarStack")) {
+            imageList = getImagesFromThumbnailsArray(
+                owner.getObject("avatarStack").getObject("avatarStackViewModel")
+                    .getArray("avatars")
+                    // only consider the first collaborator, which is the video owner
+                    .getObject(0)
+                    .getObject("avatarViewModel")
+                    .getObject("image")
+                    .getArray("sources"));
+        } else {
+            imageList = getImagesFromThumbnailsArray(owner.getObject(THUMBNAIL)
+                    .getArray(THUMBNAILS));
+        }
 
         if (imageList.isEmpty() && ageLimit == NO_AGE_LIMIT) {
             throw new ParsingException("Could not get uploader avatars");
@@ -571,12 +608,24 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     public long getUploaderSubscriberCount() throws ParsingException {
         final JsonObject videoOwnerRenderer = JsonUtils.getObject(videoSecondaryInfoRenderer,
                 "owner.videoOwnerRenderer");
-        if (!videoOwnerRenderer.has("subscriberCountText")) {
+
+        String subscriberCountText = null;
+        if (videoOwnerRenderer.has("subscriberCountText")) {
+            subscriberCountText = getTextFromObject(videoOwnerRenderer
+                .getObject("subscriberCountText"));
+        } else {
+            final String content = YoutubeParsingHelper.getFirstCollaborator(
+                videoOwnerRenderer.getObject("navigationEndpoint")
+            ).getObject("subtitle").getString("content");
+            subscriberCountText = content.split("•")[1];
+        }
+
+        if (isNullOrEmpty(subscriberCountText)) {
             return UNKNOWN_SUBSCRIBER_COUNT;
         }
+
         try {
-            return Utils.mixedNumberWordToLong(getTextFromObject(videoOwnerRenderer
-                    .getObject("subscriberCountText")));
+            return Utils.mixedNumberWordToLong(subscriberCountText);
         } catch (final NumberFormatException e) {
             throw new ParsingException("Could not get uploader subscriber count", e);
         }
@@ -590,9 +639,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         // There is no DASH manifest available with the iOS client
         return getManifestUrl(
                 "dash",
-                Arrays.asList(
-                        new Pair<>(androidStreamingData, androidStreamingUrlsPoToken),
-                        new Pair<>(html5StreamingData, html5StreamingUrlsPoToken)),
+                List.of(new Pair<>(androidStreamingData, androidStreamingUrlsPoToken)),
                 // Return version 7 of the DASH manifest, which is the latest one, reducing
                 // manifest size and allowing playback with some DASH players
                 "mpd_version=7");
@@ -610,10 +657,8 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         // unless a Safari macOS user agent is used
         return getManifestUrl(
                 "hls",
-                Arrays.asList(
-                        new Pair<>(iosStreamingData, iosStreamingUrlsPoToken),
-                        new Pair<>(androidStreamingData, androidStreamingUrlsPoToken),
-                        new Pair<>(html5StreamingData, html5StreamingUrlsPoToken)),
+                List.of(new Pair<>(iosStreamingData, iosStreamingUrlsPoToken),
+                        new Pair<>(androidStreamingData, androidStreamingUrlsPoToken)),
                 "");
     }
 
@@ -717,7 +762,8 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     private void setStreamType() {
         if (playerResponse.getObject(PLAYABILITY_STATUS).has("liveStreamability")) {
             streamType = StreamType.LIVE_STREAM;
-        } else if (playerResponse.getObject("videoDetails").getBoolean("isPostLiveDvr", false)) {
+        } else if (playerResponse.getObject(VIDEO_DETAILS)
+                .getBoolean("isPostLiveDvr", false)) {
             streamType = StreamType.POST_LIVE_STREAM;
         } else {
             streamType = StreamType.VIDEO_STREAM;
@@ -798,17 +844,6 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     // Fetch page
     //////////////////////////////////////////////////////////////////////////*/
 
-    private static final String FORMATS = "formats";
-    private static final String ADAPTIVE_FORMATS = "adaptiveFormats";
-    private static final String STREAMING_DATA = "streamingData";
-    private static final String NEXT = "next";
-    private static final String SIGNATURE_CIPHER = "signatureCipher";
-    private static final String CIPHER = "cipher";
-    private static final String PLAYER_CAPTIONS_TRACKLIST_RENDERER
-            = "playerCaptionsTracklistRenderer";
-    private static final String CAPTIONS = "captions";
-    private static final String PLAYABILITY_STATUS = "playabilityStatus";
-
     @Override
     public void onFetchPage(@Nonnull final Downloader downloader)
             throws IOException, ExtractionException {
@@ -820,20 +855,20 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         final PoTokenProvider poTokenProviderInstance = poTokenProvider;
         final boolean noPoTokenProviderSet = poTokenProviderInstance == null;
 
-        fetchHtml5Client(localization, contentCountry, videoId, poTokenProviderInstance);
-
-        setStreamType();
-
         final PoTokenResult androidPoTokenResult = noPoTokenProviderSet ? null
                 : poTokenProviderInstance.getAndroidClientPoToken(videoId);
 
         fetchAndroidClient(localization, contentCountry, videoId, androidPoTokenResult);
+
+        setStreamType();
 
         if (fetchIosClient) {
             final PoTokenResult iosPoTokenResult = noPoTokenProviderSet ? null
                     : poTokenProviderInstance.getIosClientPoToken(videoId);
             fetchIosClient(localization, contentCountry, videoId, iosPoTokenResult);
         }
+
+        fetchWebClientMetadataAndSetThumbnails(localization, contentCountry, videoId);
 
         final byte[] nextBody = JsonWriter.string(
                 prepareDesktopJsonBuilder(localization, contentCountry)
@@ -854,167 +889,76 @@ public class YoutubeStreamExtractor extends StreamExtractor {
 
         final String reason = playabilityStatus.getString("reason");
 
-        if (status.equalsIgnoreCase("login_required")) {
-            if (reason == null) {
-                final String message = playabilityStatus.getArray("messages").getString(0);
-                if (message != null && message.contains("private")) {
+        if (reason != null) {
+            if (status.equalsIgnoreCase("login_required")) {
+                if (reason.contains("inappropriate for some users")) {
+                    throw new AgeRestrictedContentException(
+                            "This age-restricted video cannot be watched anonymously");
+                }
+
+                if (reason.contains("private")) {
                     throw new PrivateContentException("This video is private");
                 }
-            } else if (reason.contains("age")) {
-                throw new AgeRestrictedContentException(
-                        "This age-restricted video cannot be watched anonymously");
-            }
-        }
 
-        if ((status.equalsIgnoreCase("unplayable") || status.equalsIgnoreCase("error"))
-                && reason != null) {
-            if (reason.contains("Music Premium")) {
-                throw new YoutubeMusicPremiumContentException();
-            }
-
-            if (reason.contains("payment")) {
-                throw new PaidContentException("This video is a paid video");
-            }
-
-            if (reason.contains("members-only")) {
-                throw new PaidContentException("This video is only available"
-                        + " for members of the channel of this video");
-            }
-
-            if (reason.contains("unavailable")) {
-                final String detailedErrorMessage = getTextFromObject(playabilityStatus
-                        .getObject("errorScreen")
-                        .getObject("playerErrorMessageRenderer")
-                        .getObject("subreason"));
-                if (detailedErrorMessage != null && detailedErrorMessage.contains("country")) {
-                    throw new GeographicRestrictionException(
-                            "This video is not available in client's country.");
-                } else {
-                    throw new ContentNotAvailableException(
-                            Objects.requireNonNullElse(detailedErrorMessage, reason));
+                if (reason.contains("a bot")) {
+                    throw new SignInConfirmNotBotException(
+                            "YouTube probably temporarily blocked anonymous watch access with this"
+                                    + " IP , got error " + status + ": \"" + reason + "\"");
                 }
             }
 
-            if (reason.contains("age-restricted")) {
-                throw new AgeRestrictedContentException(
-                        "This age-restricted video cannot be watched anonymously");
+            if (status.equalsIgnoreCase("unplayable") || status.equalsIgnoreCase("error")) {
+                if (reason.contains("Music Premium")) {
+                    throw new YoutubeMusicPremiumContentException();
+                }
+
+                if (reason.contains("payment")) {
+                    throw new PaidContentException("This video is a paid video");
+                }
+
+                if (reason.contains("members")) {
+                    throw new PaidContentException("This video is only available for members of "
+                            + "the channel of this video");
+                }
+
+                if (reason.contains("country")) {
+                    throw new GeographicRestrictionException(
+                            "This video is not available in client's country.");
+                }
             }
         }
 
-        throw new ContentNotAvailableException("Got error: \"" + reason + "\"");
-    }
-
-    private void fetchHtml5Client(@Nonnull final Localization localization,
-                                  @Nonnull final ContentCountry contentCountry,
-                                  @Nonnull final String videoId,
-                                  @Nullable final PoTokenProvider poTokenProviderInstance)
-            throws IOException, ExtractionException {
-        html5Cpn = generateContentPlaybackNonce();
-
-        final JsonObject webPlayerResponse = YoutubeStreamHelper.getWebMetadataPlayerResponse(
-                    localization, contentCountry, videoId);
-
-        throwExceptionIfPlayerResponseNotValid(webPlayerResponse, videoId);
-
-        // Save the webPlayerResponse into playerResponse in the case the video cannot be
-        // played, so some metadata can be retrieved
-        playerResponse = webPlayerResponse;
-
-        // The microformat JSON object of the content is only returned on the WEB client,
-        // so we need to store it instead of getting it directly from the playerResponse
-        playerMicroFormatRenderer = playerResponse.getObject("microformat")
-                .getObject("playerMicroformatRenderer");
-
-        final JsonObject playabilityStatus = webPlayerResponse.getObject(PLAYABILITY_STATUS);
-
-        if (isVideoAgeRestricted(playabilityStatus)) {
-            fetchHtml5EmbedClient(localization, contentCountry, videoId,
-                    poTokenProviderInstance == null ? null
-                            : poTokenProviderInstance.getWebEmbedClientPoToken(videoId));
-        } else {
-            checkPlayabilityStatus(playabilityStatus);
-        }
-    }
-
-    private static void throwExceptionIfPlayerResponseNotValid(
-            @Nonnull final JsonObject webPlayerResponse,
-            @Nonnull final String videoId) throws ExtractionException {
-        if (isPlayerResponseNotValid(webPlayerResponse, videoId)) {
-            // Check the playability status, as private and deleted videos and invalid video
-            // IDs do not return the ID provided in the player response
-            // When the requested video is playable and a different video ID is returned, it
-            // has the OK playability status, meaning the ExtractionException after this check
-            // will be thrown
-            checkPlayabilityStatus(webPlayerResponse.getObject(PLAYABILITY_STATUS));
-            throw new ExtractionException("WEB player response is not valid");
-        }
-    }
-
-    private void fetchHtml5EmbedClient(@Nonnull final Localization localization,
-                                       @Nonnull final ContentCountry contentCountry,
-                                       @Nonnull final String videoId,
-                                       @Nullable final PoTokenResult webEmbedPoTokenResult)
-            throws IOException, ExtractionException {
-        html5Cpn = generateContentPlaybackNonce();
-
-        final JsonObject webEmbeddedPlayerResponse =
-                YoutubeStreamHelper.getWebEmbeddedPlayerResponse(localization, contentCountry,
-                        videoId, html5Cpn, webEmbedPoTokenResult,
-                        YoutubeJavaScriptPlayerManager.getSignatureTimestamp(videoId));
-
-        // Save the webEmbeddedPlayerResponse into playerResponse in the case the video cannot be
-        // played, so some metadata can be retrieved
-        playerResponse = webEmbeddedPlayerResponse;
-
-        // Check if the playability status in the player response, if the age-restriction could not
-        // be bypassed, an exception will be thrown
-        checkPlayabilityStatus(webEmbeddedPlayerResponse.getObject(PLAYABILITY_STATUS));
-
-        if (isPlayerResponseNotValid(webEmbeddedPlayerResponse, videoId)) {
-            throw new ExtractionException("WEB_EMBEDDED_PLAYER player response is not valid");
-        }
-
-        html5StreamingData = webEmbeddedPlayerResponse.getObject(STREAMING_DATA);
-        playerCaptionsTracklistRenderer = webEmbeddedPlayerResponse.getObject(CAPTIONS)
-                .getObject(PLAYER_CAPTIONS_TRACKLIST_RENDERER);
-        if (webEmbedPoTokenResult != null) {
-            html5StreamingUrlsPoToken = webEmbedPoTokenResult.streamingDataPoToken;
-        }
+        throw new ContentNotAvailableException("Got error " + status + ": \"" + reason + "\"");
     }
 
     private void fetchAndroidClient(@Nonnull final Localization localization,
                                     @Nonnull final ContentCountry contentCountry,
                                     @Nonnull final String videoId,
-                                    @Nullable final PoTokenResult androidPoTokenResult) {
-        try {
-            androidCpn = generateContentPlaybackNonce();
+                                    @Nullable final PoTokenResult androidPoTokenResult)
+            throws IOException, ExtractionException {
+        androidCpn = generateContentPlaybackNonce();
 
-            final JsonObject androidPlayerResponse;
-            if (androidPoTokenResult == null) {
-                androidPlayerResponse = YoutubeStreamHelper.getAndroidReelPlayerResponse(
-                        contentCountry, localization, videoId, androidCpn);
-            } else {
-                androidPlayerResponse = YoutubeStreamHelper.getAndroidPlayerResponse(
-                        contentCountry, localization, videoId, androidCpn,
-                        androidPoTokenResult);
-            }
+        if (androidPoTokenResult == null) {
+            playerResponse = YoutubeStreamHelper.getAndroidReelPlayerResponse(
+                    contentCountry, localization, videoId, androidCpn);
+        } else {
+            playerResponse = YoutubeStreamHelper.getAndroidPlayerResponse(
+                    contentCountry, localization, videoId, androidCpn,
+                    androidPoTokenResult);
+        }
 
-            if (!isPlayerResponseNotValid(androidPlayerResponse, videoId)) {
-                androidStreamingData = androidPlayerResponse.getObject(STREAMING_DATA);
+        checkPlayabilityStatus(playerResponse.getObject(PLAYABILITY_STATUS));
+        if (isPlayerResponseNotValid(playerResponse, videoId)) {
+            throw new ExtractionException("ANDROID player response is not valid");
+        }
 
-                if (isNullOrEmpty(playerCaptionsTracklistRenderer)) {
-                    playerCaptionsTracklistRenderer =
-                            androidPlayerResponse.getObject(CAPTIONS)
-                                    .getObject(PLAYER_CAPTIONS_TRACKLIST_RENDERER);
-                }
+        androidStreamingData = playerResponse.getObject(STREAMING_DATA);
 
-                if (androidPoTokenResult != null) {
-                    androidStreamingUrlsPoToken = androidPoTokenResult.streamingDataPoToken;
-                }
-            }
-        } catch (final Exception ignored) {
-            // Ignore exceptions related to ANDROID client fetch or parsing, as it is not
-            // compulsory to play contents
+        playerCaptionsTracklistRenderer = playerResponse.getObject(CAPTIONS)
+                .getObject(PLAYER_CAPTIONS_TRACKLIST_RENDERER);
+
+        if (androidPoTokenResult != null) {
+            androidStreamingUrlsPoToken = androidPoTokenResult.streamingDataPoToken;
         }
     }
 
@@ -1043,6 +987,47 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         } catch (final Exception ignored) {
             // Ignore exceptions related to IOS client fetch or parsing, as it is not
             // compulsory to play contents
+        }
+    }
+
+    private void fetchWebClientMetadataAndSetThumbnails(
+            @Nonnull final Localization localization,
+            @Nonnull final ContentCountry contentCountry,
+            @Nonnull final String videoId) {
+        try {
+            final JsonObject webPlayerResponse = YoutubeStreamHelper.getWebMetadataPlayerResponse(
+                    localization, contentCountry, videoId);
+
+            // Important note: we don't checkPlayabilityStatus() here, because we use this request
+            // exclusively for metadata, not for extracting streams. It turns out that when
+            // YouTube returns a playability status error, the metadata may still be there.
+
+            if (!isPlayerResponseNotValid(webPlayerResponse, videoId)) {
+                // The microformat JSON object of the content is only returned on the WEB client,
+                // so we need to store it instead of getting it directly from the playerResponse
+                playerMicroFormatRenderer = webPlayerResponse.getObject("microformat")
+                        .getObject("playerMicroformatRenderer");
+
+                // Try to use web player response thumbnails first, as they should contain higher
+                // quality ones than mobile clients
+                final JsonObject thumbnailWebJsonObj = webPlayerResponse.getObject(VIDEO_DETAILS)
+                        .getObject(THUMBNAIL);
+                if (thumbnailWebJsonObj.containsKey(THUMBNAILS)) {
+                    thumbnailsArray = thumbnailWebJsonObj.getArray(THUMBNAILS);
+                } else {
+                    thumbnailsArray = playerResponse.getObject(VIDEO_DETAILS)
+                            .getObject(THUMBNAIL)
+                            .getArray(THUMBNAILS);
+                }
+            }
+        } catch (final Exception e) {
+            // Ignore exceptions related to WEB client fetch or parsing, as it is not
+            // compulsory to play contents
+            // Set thumbnails from playerResponse
+            playerMicroFormatRenderer = new JsonObject();
+            thumbnailsArray = playerResponse.getObject(VIDEO_DETAILS)
+                    .getObject(THUMBNAIL)
+                    .getArray(THUMBNAILS);
         }
     }
 
@@ -1079,15 +1064,8 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     private static boolean isPlayerResponseNotValid(
             @Nonnull final JsonObject playerResponse,
             @Nonnull final String videoId) {
-        return !videoId.equals(playerResponse.getObject("videoDetails")
+        return !videoId.equals(playerResponse.getObject(VIDEO_DETAILS)
                 .getString("videoId"));
-    }
-
-    private static boolean isVideoAgeRestricted(@Nonnull final JsonObject playabilityStatus) {
-        // This is language dependent
-        return "login_required".equalsIgnoreCase(playabilityStatus.getString("status"))
-                && playabilityStatus.getString("reason", "")
-                .contains("age");
     }
 
     /*//////////////////////////////////////////////////////////////////////////
@@ -1141,18 +1119,6 @@ public class YoutubeStreamExtractor extends StreamExtractor {
             final List<T> streamList = new ArrayList<>();
 
             java.util.stream.Stream.of(
-                    /*
-                    Use the html5StreamingData object first because YouTube should have less
-                    control on HTML5 clients, especially for poTokens
-
-                    The androidStreamingData is used as second way as the Android client extraction
-                    is more likely to break
-
-                    As iOS streaming data is affected by poTokens and not passing them should lead
-                    to 403 responses, it should be used in the last resort
-                     */
-                    new Pair<>(html5StreamingData,
-                            new Pair<>(html5Cpn, html5StreamingUrlsPoToken)),
                     new Pair<>(androidStreamingData,
                             new Pair<>(androidCpn, androidStreamingUrlsPoToken)),
                     new Pair<>(iosStreamingData,
@@ -1379,6 +1345,9 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         itagItem.setIndexEnd(Integer.parseInt(indexRange.getString("end", "-1")));
         itagItem.setQuality(formatData.getString("quality"));
         itagItem.setCodec(codec);
+        itagItem.setIsDrc(formatData.getBoolean("isDrc", false));
+        itagItem.setLastModified(Long.parseLong(formatData.getString("lastModified", "-1")));
+        itagItem.setXtags(formatData.getString("xtags"));
 
         if (streamType == StreamType.LIVE_STREAM || streamType == StreamType.POST_LIVE_STREAM) {
             itagItem.setTargetDurationSec(formatData.getInt("targetDurationSec"));
@@ -1517,6 +1486,12 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     @Override
     public Privacy getPrivacy() {
         return playerMicroFormatRenderer.getBoolean("isUnlisted")
+                || getVideoPrimaryInfoRenderer().getArray("badges")
+                .streamAsJsonObjects()
+                .anyMatch(badge ->
+                        "PRIVACY_UNLISTED".equals(badge.getObject("metadataBadgeRenderer")
+                                .getObject("icon")
+                                .getString("iconType")))
                 ? Privacy.UNLISTED
                 : Privacy.PUBLIC;
     }
@@ -1540,7 +1515,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
         final JsonArray contents = metadataRowRenderer.getArray("contents");
         final String license = getTextFromObject(contents.getObject(0));
         return license != null
-                && "Licence".equals(getTextFromObject(metadataRowRenderer.getObject("title")))
+                && "Licence".equals(getTextFromObject(metadataRowRenderer.getObject(TITLE)))
                 ? license
                 : "YouTube licence";
     }
@@ -1553,7 +1528,7 @@ public class YoutubeStreamExtractor extends StreamExtractor {
     @Nonnull
     @Override
     public List<String> getTags() {
-        return JsonUtils.getStringListFromJsonArray(playerResponse.getObject("videoDetails")
+        return JsonUtils.getStringListFromJsonArray(playerResponse.getObject(VIDEO_DETAILS)
                 .getArray("keywords"));
     }
 
@@ -1607,17 +1582,16 @@ public class YoutubeStreamExtractor extends StreamExtractor {
                 break;
             }
 
-            final String title = getTextFromObject(segmentJson.getObject("title"));
+            final String title = getTextFromObject(segmentJson.getObject(TITLE));
             if (isNullOrEmpty(title)) {
                 throw new ParsingException("Could not get stream segment title.");
             }
 
             final StreamSegment segment = new StreamSegment(title, startTimeSeconds);
             segment.setUrl(getUrl() + "?t=" + startTimeSeconds);
-            if (segmentJson.has("thumbnail")) {
-                final JsonArray previewsArray = segmentJson
-                        .getObject("thumbnail")
-                        .getArray("thumbnails");
+            if (segmentJson.has(THUMBNAIL)) {
+                final JsonArray previewsArray = segmentJson.getObject(THUMBNAIL)
+                        .getArray(THUMBNAILS);
                 if (!previewsArray.isEmpty()) {
                     // Assume that the thumbnail with the highest resolution is at the last position
                     final String url = previewsArray

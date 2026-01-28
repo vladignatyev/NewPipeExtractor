@@ -26,7 +26,6 @@ import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.DES
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.IOS_CLIENT_VERSION;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.IOS_DEVICE_MODEL;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.IOS_USER_AGENT_VERSION;
-import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.TVHTML5_USER_AGENT;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.WEB_CLIENT_ID;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.WEB_CLIENT_NAME;
 import static org.schabi.newpipe.extractor.services.youtube.ClientsConstants.WEB_HARDCODED_CLIENT_VERSION;
@@ -67,10 +66,6 @@ import java.io.IOException;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
-import java.time.LocalDate;
-import java.time.OffsetDateTime;
-import java.time.ZoneOffset;
-import java.time.format.DateTimeParseException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -182,8 +177,6 @@ public final class YoutubeParsingHelper {
     private static final Pattern C_WEB_PATTERN = Pattern.compile("&c=WEB");
     private static final Pattern C_WEB_EMBEDDED_PLAYER_PATTERN =
             Pattern.compile("&c=WEB_EMBEDDED_PLAYER");
-    private static final Pattern C_TVHTML5_PLAYER_PATTERN =
-            Pattern.compile("&c=TVHTML5");
     private static final Pattern C_ANDROID_PATTERN = Pattern.compile("&c=ANDROID");
     private static final Pattern C_IOS_PATTERN = Pattern.compile("&c=IOS");
 
@@ -291,20 +284,6 @@ public final class YoutubeParsingHelper {
             return FEED_BASE_CHANNEL_ID + channelIdOrUser.replace("channel/", "");
         } else {
             return FEED_BASE_CHANNEL_ID + channelIdOrUser;
-        }
-    }
-
-    public static OffsetDateTime parseDateFrom(final String textualUploadDate)
-            throws ParsingException {
-        try {
-            return OffsetDateTime.parse(textualUploadDate);
-        } catch (final DateTimeParseException e) {
-            try {
-                return LocalDate.parse(textualUploadDate).atStartOfDay().atOffset(ZoneOffset.UTC);
-            } catch (final DateTimeParseException e1) {
-                throw new ParsingException("Could not parse date: \"" + textualUploadDate + "\"",
-                        e1);
-            }
         }
     }
 
@@ -777,6 +756,22 @@ public final class YoutubeParsingHelper {
                     .getString("playlistId");
         }
 
+        if (navigationEndpoint.has("showDialogCommand")) {
+            try {
+                final JsonArray listItems = JsonUtils.getArray(navigationEndpoint,
+                    "showDialogCommand.panelLoadingStrategy.inlineContent.dialogViewModel"
+                    + ".customContent.listViewModel.listItems");
+
+                // the first item seems to always be the channel that actually uploaded the video,
+                // i.e. it appears in their video feed
+                final JsonObject command = JsonUtils.getObject(listItems.getObject(0),
+                    "listItemViewModel.rendererContext.commandContext.onTap.innertubeCommand");
+                return getUrlFromNavigationEndpoint(command);
+            } catch (final ParsingException p) {
+            }
+        }
+
+
         if (navigationEndpoint.has("commandMetadata")) {
             final JsonObject metadata = navigationEndpoint.getObject("commandMetadata")
                     .getObject("webCommandMetadata");
@@ -1121,17 +1116,6 @@ public final class YoutubeParsingHelper {
     }
 
     /**
-     * Get the user-agent string used as the user-agent for InnerTube requests with the HTML5 TV
-     * client.
-     *
-     * @return the user-agent used for InnerTube requests with the TVHTML5 client
-     */
-    @Nonnull
-    public static String getTvHtml5UserAgent() {
-        return TVHTML5_USER_AGENT;
-    }
-
-    /**
      * Returns a {@link Map} containing the required YouTube Music headers.
      */
     @Nonnull
@@ -1387,17 +1371,6 @@ public final class YoutubeParsingHelper {
     }
 
     /**
-     * Check if the streaming URL is a URL from the YouTube {@code TVHTML5} client.
-     *
-     * @param url the streaming URL on which check if it's a {@code TVHTML5}
-     *            streaming URL.
-     * @return true if it's a {@code TVHTML5} streaming URL, false otherwise
-     */
-    public static boolean isTvHtml5StreamingUrl(@Nonnull final String url) {
-        return Parser.isMatch(C_TVHTML5_PLAYER_PATTERN, url);
-    }
-
-    /**
      * Check if the streaming URL is a URL from the YouTube {@code ANDROID} client.
      *
      * @param url the streaming URL to be checked.
@@ -1589,5 +1562,25 @@ public final class YoutubeParsingHelper {
                 .end();
 
         return builder;
+    }
+
+    /**
+     * Gets the first collaborator, which is the channel that owns the video,
+     * i.e. the video is displayed on their channel page.
+     *
+     * @param navigationEndpoint JSON object for the navigationEndpoint
+     * @return The first collaborator in the JSON object or {@code null}
+     */
+    @Nullable
+    public static JsonObject getFirstCollaborator(final JsonObject navigationEndpoint)
+            throws ParsingException {
+        try {
+            // CHECKSTYLE:OFF
+            final JsonArray listItems = JsonUtils.getArray(navigationEndpoint, "showDialogCommand.panelLoadingStrategy.inlineContent.dialogViewModel.customContent.listViewModel.listItems");
+            // CHECKSTYLE:ON
+            return listItems.getObject(0).getObject("listItemViewModel");
+        } catch (final ParsingException e) {
+            return null;
+        }
     }
 }
